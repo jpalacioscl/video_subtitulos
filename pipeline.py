@@ -230,8 +230,15 @@ def _transcribe_stable(audio_path: str, opts: PipelineOptions) -> tuple[list[Seg
     w_model, w_device, w_compute = resolve_whisper_config(opts)
     log.info(f"[stable-ts] Modelo '{w_model}' en {w_device}/{w_compute}")
 
-    lang = None if opts.language == "auto" else opts.language
     is_music = opts.use_demucs
+    # En modo música con auto-detección, Whisper analiza los primeros 30s
+    # que pueden ser solo instrumentales → detecta idioma incorrecto y alucina.
+    # Forzar inglés como defecto seguro cuando el usuario no especifica.
+    if opts.language == "auto" and is_music:
+        lang = "en"
+        log.info("[stable-ts] Modo música + auto → forzando idioma 'en' para evitar alucinaciones")
+    else:
+        lang = None if opts.language == "auto" else opts.language
 
     model = stable_whisper.load_faster_whisper(w_model, device=w_device,
                                                compute_type=w_compute)
@@ -239,22 +246,27 @@ def _transcribe_stable(audio_path: str, opts: PipelineOptions) -> tuple[list[Seg
         audio_path,
         language=lang,
         beam_size=5,
-        # suppress_silence=True ajusta cada segmento al inicio real del audio,
-        # eliminando el offset que Whisper introduce con silencios/música antes de la voz
         suppress_silence=True,
         suppress_word_ts=False,
-        vad=is_music,           # VAD adicional de stable-ts para música
-        regroup=True,           # reagrupa frases de forma natural
+        vad=False,              # Demucs ya separó las vocales; VAD extra es redundante
+        regroup=True,
+        no_speech_threshold=0.4,
     )
 
-    detected_lang = result.language or (lang or "en")
+    detected_lang = result.language or lang or "en"
     log.info(f"[stable-ts] Idioma detectado: {detected_lang}")
 
+    seen_texts: set[str] = set()
     segments = []
     for i, seg in enumerate(result.segments, 1):
         text = seg.text.strip()
         if not text:
             continue
+        # Filtrar alucinaciones: Whisper repite la misma frase cuando no entiende el audio
+        if text in seen_texts:
+            log.warning(f"[stable-ts] Alucinación detectada y descartada: {text!r}")
+            continue
+        seen_texts.add(text)
         segments.append(Segment(index=i, start=round(seg.start, 3),
                                 end=round(seg.end, 3), text=text))
 

@@ -194,10 +194,12 @@ document.getElementById('use-demucs').addEventListener('change', function() {
   const whisperSel = document.getElementById('whisper-model');
   const llmHint    = document.getElementById('llm-hint');
   const llmChk     = document.getElementById('correct-llm');
+  const langSel = document.getElementById('language');
   if (this.checked) {
     if (whisperSel.value === 'auto' || whisperSel.value === 'medium') {
       whisperSel.value = 'large-v3';
     }
+    if (langSel.value === 'auto') langSel.value = 'en';
     llmHint.textContent = 'No recomendado para letras';
     llmChk.checked = false;
   } else {
