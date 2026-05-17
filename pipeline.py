@@ -13,6 +13,7 @@ Orquesta el pipeline completo de generación de subtítulos:
 
 import logging
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -152,10 +153,9 @@ def separate_vocals(wav_path: str, work_dir: str) -> str:
     log.info("[Demucs] Separando vocales (puede tardar varios minutos)...")
 
     cmd = [
-        "python", "-m", "demucs",
+        sys.executable, "-m", "demucs",  # mismo Python del venv
         "--two-stems", "vocals",
         "--out", work_dir,
-        "--mp3",                # salida mp3 para ahorrar espacio temporal
         "--device", "cpu",      # CPU para no competir con llama-server por VRAM
         wav_path,
     ]
@@ -165,20 +165,24 @@ def separate_vocals(wav_path: str, work_dir: str) -> str:
         log.warning(f"[Demucs] Error: {err[-300:]}. Usando audio original.")
         return wav_path
 
-    # Demucs crea: {work_dir}/htdemucs/{stem_sin_ext}/vocals.mp3
-    stem = Path(wav_path).stem
-    vocals = next(Path(work_dir).rglob(f"vocals.*"), None)
+    # Demucs crea: {work_dir}/htdemucs/{stem}/vocals.wav
+    # Salida WAV (sin --mp3) evita el encoder delay del MP3 que desincroniza
+    vocals = next(Path(work_dir).rglob("vocals.wav"), None)
     if vocals and vocals.exists():
-        # Convertir a WAV 16kHz para Whisper
+        size_mb = vocals.stat().st_size / 1024 / 1024
+        log.info(f"[Demucs] Vocales separadas: {vocals} ({size_mb:.1f} MB)")
+
+        # Convertir a WAV mono 16 kHz para Whisper
         vocals_wav = str(Path(work_dir) / "vocals_16k.wav")
-        subprocess.run(
+        r = subprocess.run(
             ["ffmpeg", "-i", str(vocals), "-ac", "1", "-ar", "16000",
              "-acodec", "pcm_s16le", "-y", vocals_wav],
             capture_output=True, timeout=120,
         )
-        if Path(vocals_wav).exists():
-            log.info(f"[Demucs] Vocales separadas: {vocals_wav}")
+        if r.returncode == 0 and Path(vocals_wav).exists():
             return vocals_wav
+        log.warning(f"[Demucs] ffmpeg falló al convertir vocales: "
+                    f"{r.stderr.decode(errors='replace')[-200:]}")
 
     log.warning("[Demucs] No se encontró vocals.wav. Usando audio original.")
     return wav_path
@@ -195,7 +199,19 @@ def transcribe(audio_path: str, opts: PipelineOptions) -> tuple[list[Segment], d
 
     lang = None if opts.language == "auto" else opts.language
     is_music = opts.use_demucs
-    silence_ms = 800 if is_music else 500
+
+    # Voz cantada tiene características acústicas distintas al habla:
+    # el VAD de Silero tiende a no detectarla con el umbral por defecto (0.5).
+    # Con threshold=0.25 y speech_pad_ms=500 se captura la voz cantada
+    # sin introducir demasiados falsos positivos de instrumentos.
+    if is_music:
+        vad_params = {
+            "threshold": 0.25,
+            "min_silence_duration_ms": 500,
+            "speech_pad_ms": 500,
+        }
+    else:
+        vad_params = {"min_silence_duration_ms": 500}
 
     def _run_transcribe(vad: bool) -> tuple[list[Segment], object]:
         raw_segs, info = model.transcribe(
@@ -203,10 +219,10 @@ def transcribe(audio_path: str, opts: PipelineOptions) -> tuple[list[Segment], d
             language=lang,
             beam_size=5,
             vad_filter=vad,
-            vad_parameters={"min_silence_duration_ms": silence_ms} if vad else {},
-            word_timestamps=False,          # timestamps de segmento, más fiables para música
+            vad_parameters=vad_params if vad else {},
+            word_timestamps=False,
             condition_on_previous_text=not is_music,
-            no_speech_threshold=0.6,        # descartar segmentos de baja confianza
+            no_speech_threshold=0.3 if is_music else 0.6,
         )
         segs = []
         for i, seg in enumerate(raw_segs, 1):
