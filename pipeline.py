@@ -117,8 +117,12 @@ def segments_to_srt(segments: list[Segment]) -> str:
 
 # ── Etapa 1: extracción de audio ───────────────────────────────────────────────
 
+def _run_ffmpeg(cmd: list, timeout: int = 600) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, timeout=timeout)
+
+
 def extract_audio(input_path: str, output_path: str) -> str:
-    """Convierte cualquier formato a WAV mono 16 kHz con 3 estrategias."""
+    """Convierte cualquier formato a WAV mono 16 kHz (para Whisper)."""
     flags = ["-ac", "1", "-ar", "16000", "-acodec", "pcm_s16le", "-y"]
 
     strategies = [
@@ -129,7 +133,7 @@ def extract_audio(input_path: str, output_path: str) -> str:
     ]
 
     for i, cmd in enumerate(strategies, 1):
-        result = subprocess.run(cmd, capture_output=True, timeout=600)
+        result = _run_ffmpeg(cmd)
         if result.returncode == 0:
             log.info(f"[Audio] Extraído con estrategia {i}: {output_path}")
             return output_path
@@ -140,6 +144,22 @@ def extract_audio(input_path: str, output_path: str) -> str:
         f"ffmpeg no pudo extraer el audio. El archivo puede estar corrupto.\n"
         f"Detalle: {stderr[-400:]}"
     )
+
+
+def extract_audio_hq(input_path: str, output_path: str) -> str:
+    """Extrae audio estéreo 44100 Hz para Demucs (requiere mayor calidad)."""
+    flags = ["-ac", "2", "-ar", "44100", "-acodec", "pcm_s16le", "-y"]
+    strategies = [
+        ["ffmpeg", "-i", input_path] + flags + [output_path],
+        ["ffmpeg", "-i", input_path, "-map", "0:a:0"] + flags + [output_path],
+    ]
+    for i, cmd in enumerate(strategies, 1):
+        result = _run_ffmpeg(cmd)
+        if result.returncode == 0:
+            log.info(f"[Audio HQ] Extraído con estrategia {i}: {output_path}")
+            return output_path
+    log.warning("[Audio HQ] Falló extracción HQ, usando 16kHz como fallback")
+    return extract_audio(input_path, output_path)
 
 
 # ── Etapa 2: separación vocal con Demucs ──────────────────────────────────────
@@ -206,9 +226,9 @@ def transcribe(audio_path: str, opts: PipelineOptions) -> tuple[list[Segment], d
     # sin introducir demasiados falsos positivos de instrumentos.
     if is_music:
         vad_params = {
-            "threshold": 0.25,
-            "min_silence_duration_ms": 500,
-            "speech_pad_ms": 500,
+            "threshold": 0.45,      # Demucs da vocales limpias; 0.25 era para audio mezclado
+            "min_silence_duration_ms": 600,
+            "speech_pad_ms": 200,   # poco padding para no incluir silencio pre-vocal
         }
     else:
         vad_params = {"min_silence_duration_ms": 500}
@@ -274,12 +294,15 @@ class PipelineRunner:
 
             # 1. Extraer audio
             self._step("Extrayendo audio", 10)
-            extract_audio(input_path, wav)
-
-            # 2. Separar vocales (opcional)
             if opts.use_demucs:
+                # Demucs necesita 44100 Hz estéreo para una separación precisa.
+                # Con 16 kHz mono la separación es peor y filtra mal los instrumentos.
+                audio_hq = str(Path(tmp) / "audio_hq.wav")
+                extract_audio_hq(input_path, audio_hq)
                 self._step("Separando vocales (Demucs)", 25)
-                wav = separate_vocals(wav, tmp)
+                wav = separate_vocals(audio_hq, tmp)
+            else:
+                extract_audio(input_path, wav)
 
             # 3. Transcribir
             self._step("Transcribiendo con Whisper", 40)
