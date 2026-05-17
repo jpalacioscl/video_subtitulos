@@ -20,8 +20,8 @@ from pathlib import Path
 from flask import Flask, jsonify, render_template, request, send_file
 
 from llm_client import LlamaServerClient
-from pipeline import PipelineOptions, PipelineRunner, segments_to_srt
-from youtube import download_video, is_youtube_url
+from pipeline import PipelineOptions, PipelineRunner, Segment, segments_to_srt
+from youtube import download_video, fetch_subtitles, is_youtube_url
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
@@ -62,6 +62,35 @@ def _progress(job_id: str):
         with jobs_lock:
             jobs[job_id].update(status="running", step=step, percent=pct)
     return _cb
+
+
+def _finish_from_raw(job_id: str, job_dir: Path, source_name: str,
+                     raw_segs: list, opts: PipelineOptions):
+    """Convierte segmentos crudos (de YouTube) en SRT sin pasar por ASR."""
+    from pipeline import format_segments
+    try:
+        segments = [Segment(index=s["index"], start=s["start"],
+                            end=s["end"],   text=s["text"])
+                    for s in raw_segs]
+
+        with jobs_lock:
+            jobs[job_id].update(step="Aplicando formato profesional", percent=85)
+        segments = format_segments(segments)
+
+        srt_content = segments_to_srt(segments)
+        srt_name    = Path(source_name).stem + ".srt"
+        srt_path    = job_dir / srt_name
+        srt_path.write_text(srt_content, encoding="utf-8")
+
+        with jobs_lock:
+            jobs[job_id].update(
+                status="done", step="Completado (subtítulos YouTube)",
+                percent=100, srt_path=str(srt_path),
+                language="?", duration=0, segments=len(segments),
+            )
+        log.info(f"[Job {job_id[:8]}] Completado desde YouTube. {len(segments)} segmentos.")
+    except Exception as e:
+        _fail(job_id, str(e))
 
 
 def _run_job(job_id: str, video_path: str, opts: PipelineOptions):
@@ -130,13 +159,23 @@ def create_job():
     if url:
         def run_yt():
             try:
+                # Intentar subtítulos existentes primero (mucho más precisos para música)
                 with jobs_lock:
                     jobs[job_id].update(status="running",
-                                        step="Descargando video", percent=5)
-                video_path = download_video(url, str(job_dir))
-                _run_job(job_id, video_path, opts)
+                                        step="Buscando subtítulos en YouTube", percent=5)
+                lang = opts.language if opts.language != "auto" else "en"
+                raw_segs = fetch_subtitles(url, lang=lang)
+
+                if raw_segs:
+                    _finish_from_raw(job_id, job_dir, url, raw_segs, opts)
+                else:
+                    log.info(f"[Job {job_id[:8]}] Sin subtítulos en YouTube, usando pipeline ASR")
+                    with jobs_lock:
+                        jobs[job_id].update(step="Descargando video", percent=10)
+                    video_path = download_video(url, str(job_dir))
+                    _run_job(job_id, video_path, opts)
             except Exception as e:
-                _fail(job_id, f"Error descargando YouTube: {e}")
+                _fail(job_id, f"Error procesando YouTube: {e}")
 
         threading.Thread(target=run_yt, daemon=True).start()
         return jsonify({"job_id": job_id}), 202

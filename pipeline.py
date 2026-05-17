@@ -211,6 +211,71 @@ def separate_vocals(wav_path: str, work_dir: str) -> str:
 # ── Etapa 3: transcripción ASR ─────────────────────────────────────────────────
 
 def transcribe(audio_path: str, opts: PipelineOptions) -> tuple[list[Segment], dict]:
+    """
+    Transcribe con WhisperX (Whisper + forced alignment via wav2vec2).
+    WhisperX produce timestamps a nivel de palabra mucho más precisos que
+    Whisper vanilla, especialmente para voz cantada.
+    Fallback a faster-whisper si WhisperX no está disponible.
+    """
+    try:
+        return _transcribe_whisperx(audio_path, opts)
+    except Exception as e:
+        log.warning(f"[WhisperX] Error ({e}), usando faster-whisper como fallback")
+        return _transcribe_faster(audio_path, opts)
+
+
+def _transcribe_whisperx(audio_path: str, opts: PipelineOptions) -> tuple[list[Segment], dict]:
+    import whisperx
+
+    w_model, w_device, w_compute = resolve_whisper_config(opts)
+    log.info(f"[WhisperX] Modelo '{w_model}' en {w_device}/{w_compute}")
+
+    lang = None if opts.language == "auto" else opts.language
+
+    model = whisperx.load_model(w_model, device=w_device, compute_type=w_compute,
+                                language=lang)
+    audio = whisperx.load_audio(audio_path)
+    result = model.transcribe(audio, batch_size=8, language=lang)
+
+    detected_lang = result.get("language", lang or "en")
+    log.info(f"[WhisperX] Idioma detectado: {detected_lang}")
+
+    # Forced alignment: timestamps precisos a nivel de palabra
+    try:
+        align_model, metadata = whisperx.load_align_model(
+            language_code=detected_lang, device=w_device)
+        result = whisperx.align(result["segments"], align_model, metadata,
+                                audio, device=w_device, return_char_alignments=False)
+        log.info("[WhisperX] Forced alignment completado")
+    except Exception as e:
+        log.warning(f"[WhisperX] Forced alignment falló ({e}), usando timestamps de Whisper")
+
+    segments = []
+    for i, seg in enumerate(result["segments"], 1):
+        text = seg.get("text", "").strip()
+        if not text:
+            continue
+        # Usar timestamps de palabra si están disponibles (más precisos)
+        words = seg.get("words", [])
+        start = words[0].get("start", seg["start"]) if words else seg["start"]
+        end   = words[-1].get("end",   seg["end"])   if words else seg["end"]
+        if start is None: start = seg["start"]
+        if end   is None: end   = seg["end"]
+        segments.append(Segment(index=i, start=float(start),
+                                end=float(end), text=text))
+
+    log.info(f"[WhisperX] {len(segments)} segmentos")
+    return segments, {
+        "language":             detected_lang,
+        "language_probability": 1.0,
+        "duration":             float(audio.shape[0]) / 16000,
+        "whisper_model":        w_model,
+        "whisper_device":       w_device,
+    }
+
+
+def _transcribe_faster(audio_path: str, opts: PipelineOptions) -> tuple[list[Segment], dict]:
+    """Fallback: faster-whisper con VAD."""
     from faster_whisper import WhisperModel
 
     w_model, w_device, w_compute = resolve_whisper_config(opts)
@@ -218,52 +283,29 @@ def transcribe(audio_path: str, opts: PipelineOptions) -> tuple[list[Segment], d
     model = WhisperModel(w_model, device=w_device, compute_type=w_compute)
 
     lang = None if opts.language == "auto" else opts.language
-    is_music = opts.use_demucs
+    raw_segs, info = model.transcribe(
+        audio_path, language=lang, beam_size=5,
+        vad_filter=True,
+        vad_parameters={"min_silence_duration_ms": 500},
+        word_timestamps=False,
+        condition_on_previous_text=True,
+    )
+    segments = []
+    for i, seg in enumerate(raw_segs, 1):
+        text = seg.text.strip()
+        if text:
+            segments.append(Segment(index=i, start=seg.start, end=seg.end, text=text))
 
-    # Voz cantada tiene características acústicas distintas al habla:
-    # el VAD de Silero tiende a no detectarla con el umbral por defecto (0.5).
-    # Con threshold=0.25 y speech_pad_ms=500 se captura la voz cantada
-    # sin introducir demasiados falsos positivos de instrumentos.
-    if is_music:
-        vad_params = {
-            "threshold": 0.45,      # Demucs da vocales limpias; 0.25 era para audio mezclado
-            "min_silence_duration_ms": 600,
-            "speech_pad_ms": 200,   # poco padding para no incluir silencio pre-vocal
-        }
-    else:
-        vad_params = {"min_silence_duration_ms": 500}
-
-    def _run_transcribe(vad: bool) -> tuple[list[Segment], object]:
-        raw_segs, info = model.transcribe(
-            audio_path,
-            language=lang,
-            beam_size=5,
-            vad_filter=vad,
-            vad_parameters=vad_params if vad else {},
-            word_timestamps=False,
-            condition_on_previous_text=not is_music,
-            no_speech_threshold=0.3 if is_music else 0.6,
-        )
-        segs = []
-        for i, seg in enumerate(raw_segs, 1):
+    if not segments:
+        raw_segs2, info = model.transcribe(audio_path, language=lang, beam_size=5,
+                                           vad_filter=False, word_timestamps=False)
+        for i, seg in enumerate(raw_segs2, 1):
             text = seg.text.strip()
             if text:
-                segs.append(Segment(index=i, start=seg.start, end=seg.end, text=text))
-        return segs, info
-
-    segments, info = _run_transcribe(vad=True)
-
-    if not segments and not is_music:
-        # Fallback sin VAD solo para voz hablada, nunca para música:
-        # sin VAD, Whisper alucina texto durante intros instrumentales
-        # y los asigna a timestamps tempranos, desincronizando todo.
-        log.warning("[Whisper] VAD no detectó habla; reintentando sin VAD...")
-        segments, info = _run_transcribe(vad=False)
+                segments.append(Segment(index=i, start=seg.start, end=seg.end, text=text))
 
     detected_lang = info.language
-    log.info(f"[Whisper] {len(segments)} segmentos. Idioma: {detected_lang} "
-             f"({info.language_probability:.0%})")
-
+    log.info(f"[Whisper] {len(segments)} segmentos. Idioma: {detected_lang}")
     return segments, {
         "language":             detected_lang,
         "language_probability": round(info.language_probability, 3),
