@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VideoSubtítulos</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<main>
+  <header>
+    <h1>VideoSubtítulos</h1>
+    <p class="subtitle">Subtítulos .srt con IA 100% local</p>
+    <span id="llm-badge" class="badge {{ 'ok' if llm_available else 'off' }}">
+      LLM {{ 'conectado' if llm_available else 'sin conexión' }}
+    </span>
+  </header>
+
+  <form id="form">
+
+    <!-- Zona drag-and-drop -->
+    <div id="drop-zone" tabindex="0" role="button" aria-label="Zona de carga de video">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+        <path d="M12 16V8m0 0-3 3m3-3 3 3M4 16v1a2 2 0 002 2h12a2 2 0 002-2v-1"/>
+      </svg>
+      <p>Arrastra tu video aquí o <span class="link">haz clic para seleccionar</span></p>
+      <p class="hint">MP4, MKV, AVI, MOV, WEBM y más</p>
+      <p id="file-name" class="file-name" hidden></p>
+      <input type="file" id="file-input" accept="video/*,audio/*" hidden>
+    </div>
+
+    <!-- URL YouTube -->
+    <div class="sep-row"><span>o</span></div>
+    <div class="field">
+      <label for="url-input">URL de YouTube</label>
+      <input type="url" id="url-input" placeholder="https://www.youtube.com/watch?v=..."
+             autocomplete="off" spellcheck="false">
+    </div>
+
+    <!-- Opciones en grid 2×2 -->
+    <div class="options-grid">
+      <div class="field">
+        <label for="language">Idioma del audio</label>
+        <select id="language" name="language">
+          <option value="auto">Auto-detectar</option>
+          <option value="es">Español</option>
+          <option value="en">Inglés</option>
+          <option value="pt">Portugués</option>
+          <option value="fr">Francés</option>
+          <option value="de">Alemán</option>
+          <option value="it">Italiano</option>
+          <option value="ja">Japonés</option>
+          <option value="zh">Chino</option>
+          <option value="ko">Coreano</option>
+          <option value="ru">Ruso</option>
+          <option value="ar">Árabe</option>
+        </select>
+      </div>
+
+      <div class="field">
+        <label for="whisper-model">Modelo Whisper</label>
+        <select id="whisper-model" name="whisper_model">
+          <option value="auto" selected>Automático (recomendado)</option>
+          <option value="tiny">Tiny — más rápido</option>
+          <option value="base">Base</option>
+          <option value="small">Small</option>
+          <option value="medium">Medium</option>
+          <option value="large-v3">Large-v3 — máxima precisión</option>
+        </select>
+      </div>
+
+      <div class="field">
+        <label for="translate-to">Traducir a</label>
+        <select id="translate-to" name="translate_to">
+          <option value="">Sin traducción</option>
+          <option value="es">Español</option>
+          <option value="en">Inglés</option>
+          <option value="pt">Portugués</option>
+          <option value="fr">Francés</option>
+          <option value="de">Alemán</option>
+          <option value="it">Italiano</option>
+          <option value="ja">Japonés</option>
+          <option value="zh">Chino</option>
+        </select>
+      </div>
+
+      <div class="field checks">
+        <label class="check-row">
+          <input type="checkbox" id="use-demucs">
+          <span>
+            <strong>Video musical</strong>
+            <small id="demucs-hint">Separa vocales + optimiza letras</small>
+          </span>
+        </label>
+        <label class="check-row" id="llm-check-row">
+          <input type="checkbox" id="correct-llm" {{ 'checked' if llm_available else '' }}
+                 {{ 'disabled' if not llm_available else '' }}>
+          <span>
+            <strong>Corregir con LLM</strong>
+            <small id="llm-hint">{{ 'LLM disponible' if llm_available else 'llama-server no activo' }}</small>
+          </span>
+        </label>
+      </div>
+    </div>
+
+    <button type="submit" id="submit-btn">Generar subtítulos</button>
+  </form>
+
+  <!-- Progreso -->
+  <section id="progress-box" hidden>
+    <div class="prog-header">
+      <span id="prog-step">Iniciando...</span>
+      <span id="prog-pct">0%</span>
+    </div>
+    <div class="prog-track">
+      <div class="prog-bar" id="prog-bar"></div>
+    </div>
+  </section>
+
+  <!-- Resultado -->
+  <section id="result-box" hidden>
+    <div class="result-info">
+      <div class="result-stat" id="result-lang"></div>
+      <div class="result-stat" id="result-segs"></div>
+      <div class="result-stat" id="result-dur"></div>
+    </div>
+    <a id="download-btn" class="download-btn" href="#">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M12 3v13m0 0-4-4m4 4 4-4M4 20h16"/>
+      </svg>
+      Descargar subtitulos.srt
+    </a>
+    <button id="reset-btn" class="reset-btn">Nuevo archivo</button>
+  </section>
+
+  <!-- Error -->
+  <section id="error-box" hidden>
+    <p id="error-msg"></p>
+    <button id="error-reset-btn" class="reset-btn">Intentar de nuevo</button>
+  </section>
+</main>
+
+<script>
+const dropZone   = document.getElementById('drop-zone');
+const fileInput  = document.getElementById('file-input');
+const fileName   = document.getElementById('file-name');
+const urlInput   = document.getElementById('url-input');
+const form       = document.getElementById('form');
+const submitBtn  = document.getElementById('submit-btn');
+const progBox    = document.getElementById('progress-box');
+const progBar    = document.getElementById('prog-bar');
+const progStep   = document.getElementById('prog-step');
+const progPct    = document.getElementById('prog-pct');
+const resultBox  = document.getElementById('result-box');
+const errorBox   = document.getElementById('error-box');
+const errorMsg   = document.getElementById('error-msg');
+const downloadBtn = document.getElementById('download-btn');
+
+let pollingTimer = null;
+let selectedFile = null;
+
+// ── Drag-and-drop ─────────────────────────────────────────────────────────────
+['dragenter','dragover'].forEach(evt =>
+  dropZone.addEventListener(evt, e => { e.preventDefault(); dropZone.classList.add('drag'); })
+);
+['dragleave','drop'].forEach(evt =>
+  dropZone.addEventListener(evt, e => { e.preventDefault(); dropZone.classList.remove('drag'); })
+);
+dropZone.addEventListener('drop', e => setFile(e.dataTransfer.files[0]));
+dropZone.addEventListener('click', () => fileInput.click());
+dropZone.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') fileInput.click(); });
+fileInput.addEventListener('change', () => setFile(fileInput.files[0]));
+
+function setFile(f) {
+  if (!f) return;
+  selectedFile = f;
+  urlInput.value = '';
+  fileName.textContent = f.name;
+  fileName.hidden = false;
+  dropZone.querySelector('p').hidden = true;
+}
+
+urlInput.addEventListener('input', () => {
+  if (urlInput.value.trim()) {
+    selectedFile = null;
+    fileInput.value = '';
+    fileName.hidden = true;
+    dropZone.querySelector('p').hidden = false;
+  }
+});
+
+// Modo musical: ajustar opciones automáticamente
+document.getElementById('use-demucs').addEventListener('change', function() {
+  const whisperSel = document.getElementById('whisper-model');
+  const llmHint    = document.getElementById('llm-hint');
+  const llmChk     = document.getElementById('correct-llm');
+  if (this.checked) {
+    if (whisperSel.value === 'auto' || whisperSel.value === 'medium') {
+      whisperSel.value = 'large-v3';
+    }
+    llmHint.textContent = 'No recomendado para letras';
+    llmChk.checked = false;
+  } else {
+    if (whisperSel.value === 'large-v3') whisperSel.value = 'auto';
+    llmHint.textContent = llmChk.disabled ? 'llama-server no activo' : 'LLM disponible';
+  }
+});
+
+// ── Envío del formulario ───────────────────────────────────────────────────────
+form.addEventListener('submit', async e => {
+  e.preventDefault();
+  const url = urlInput.value.trim();
+  if (!selectedFile && !url) {
+    alert('Selecciona un archivo o ingresa una URL de YouTube.');
+    return;
+  }
+
+  const data = new FormData();
+  if (selectedFile) data.append('file', selectedFile);
+  if (url)          data.append('url', url);
+  data.append('language',       document.getElementById('language').value);
+  data.append('whisper_model',  document.getElementById('whisper-model').value);
+  data.append('translate_to',   document.getElementById('translate-to').value);
+  data.append('use_demucs',     document.getElementById('use-demucs').checked ? 'true' : 'false');
+  data.append('correct_with_llm', document.getElementById('correct-llm').checked ? 'true' : 'false');
+
+  submitBtn.disabled = true;
+  showProgress('En cola...', 0);
+
+  try {
+    const res  = await fetch('/api/jobs', { method: 'POST', body: data });
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.error || 'Error creando el job');
+    startPolling(json.job_id);
+  } catch (err) {
+    showError(err.message);
+    submitBtn.disabled = false;
+  }
+});
+
+// ── Polling ───────────────────────────────────────────────────────────────────
+function startPolling(jobId) {
+  pollingTimer = setInterval(async () => {
+    try {
+      const res  = await fetch(`/api/jobs/${jobId}`);
+      const job  = await res.json();
+      if (job.error && job.status !== 'error') return;
+
+      showProgress(job.step, job.percent);
+
+      if (job.status === 'done') {
+        clearInterval(pollingTimer);
+        showResult(jobId, job);
+      } else if (job.status === 'error') {
+        clearInterval(pollingTimer);
+        showError(job.step);
+        submitBtn.disabled = false;
+      }
+    } catch {
+      // red error, reintentar
+    }
+  }, 1000);
+}
+
+// ── Estados UI ────────────────────────────────────────────────────────────────
+function showProgress(step, pct) {
+  form.hidden      = true;
+  progBox.hidden   = false;
+  resultBox.hidden = true;
+  errorBox.hidden  = true;
+  progStep.textContent   = step;
+  progPct.textContent    = pct + '%';
+  progBar.style.width    = pct + '%';
+}
+
+function showResult(jobId, job) {
+  progBox.hidden   = false;
+  resultBox.hidden = false;
+  errorBox.hidden  = true;
+  downloadBtn.href = `/api/jobs/${jobId}/download`;
+  downloadBtn.removeAttribute('download');
+
+  const langs = { es:'Español', en:'Inglés', fr:'Francés', de:'Alemán', it:'Italiano',
+                  pt:'Portugués', ja:'Japonés', zh:'Chino', ko:'Coreano', ru:'Ruso', ar:'Árabe' };
+  document.getElementById('result-lang').textContent =
+    `Idioma: ${langs[job.language] || job.language || '?'}`;
+  document.getElementById('result-segs').textContent =
+    `${job.segments || '?'} subtítulos`;
+  document.getElementById('result-dur').textContent =
+    job.duration ? `${Math.floor(job.duration / 60)}m ${job.duration % 60}s` : '';
+}
+
+function showError(msg) {
+  form.hidden      = false;
+  progBox.hidden   = true;
+  resultBox.hidden = true;
+  errorBox.hidden  = false;
+  errorMsg.textContent = msg;
+}
+
+function resetUI() {
+  form.hidden      = false;
+  progBox.hidden   = true;
+  resultBox.hidden = true;
+  errorBox.hidden  = true;
+  submitBtn.disabled = false;
+  selectedFile = null;
+  fileInput.value = '';
+  urlInput.value = '';
+  fileName.hidden = true;
+  document.querySelector('#drop-zone p').hidden = false;
+  progBar.style.width = '0%';
+}
+
+document.getElementById('reset-btn').addEventListener('click', resetUI);
+document.getElementById('error-reset-btn').addEventListener('click', resetUI);
+
+// Refrescar estado LLM cada 30s
+setInterval(async () => {
+  try {
+    const r = await fetch('/api/health');
+    const j = await r.json();
+    const badge = document.getElementById('llm-badge');
+    const chk   = document.getElementById('correct-llm');
+    badge.className = 'badge ' + (j.llm_available ? 'ok' : 'off');
+    badge.textContent = 'LLM ' + (j.llm_available ? 'conectado' : 'sin conexión');
+    chk.disabled = !j.llm_available;
+    if (!j.llm_available) chk.checked = false;
+  } catch {}
+}, 30000);
+</script>
+</body>
+</html>

@@ -1,0 +1,5 @@
+flask>=3.0
+faster-whisper>=1.2.0
+yt-dlp>=2026.0
+requests>=2.32
+demucs>=4.0
