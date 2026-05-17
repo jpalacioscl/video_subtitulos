@@ -3,3 +3,4 @@ faster-whisper>=1.2.0
 yt-dlp>=2026.0
 requests>=2.32
 demucs>=4.0
+torchcodec>=0.12  # requerido por torchaudio para guardar audio (wav/flac)
