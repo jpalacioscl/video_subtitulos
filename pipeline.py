@@ -194,10 +194,8 @@ def transcribe(audio_path: str, opts: PipelineOptions) -> tuple[list[Segment], d
     model = WhisperModel(w_model, device=w_device, compute_type=w_compute)
 
     lang = None if opts.language == "auto" else opts.language
-    # En modo música: desactivar condicionamiento en texto previo evita que Whisper
-    # "alucine" letras durante partes instrumentales y arrastre el error al resto.
-    condition_on_prev = not opts.use_demucs
-    silence_ms = 800 if opts.use_demucs else 500
+    is_music = opts.use_demucs
+    silence_ms = 800 if is_music else 500
 
     def _run_transcribe(vad: bool) -> tuple[list[Segment], object]:
         raw_segs, info = model.transcribe(
@@ -206,19 +204,23 @@ def transcribe(audio_path: str, opts: PipelineOptions) -> tuple[list[Segment], d
             beam_size=5,
             vad_filter=vad,
             vad_parameters={"min_silence_duration_ms": silence_ms} if vad else {},
-            word_timestamps=True,
-            condition_on_previous_text=condition_on_prev,
+            word_timestamps=False,          # timestamps de segmento, más fiables para música
+            condition_on_previous_text=not is_music,
+            no_speech_threshold=0.6,        # descartar segmentos de baja confianza
         )
         segs = []
         for i, seg in enumerate(raw_segs, 1):
-            end = seg.words[-1].end if getattr(seg, "words", None) else seg.end
-            segs.append(Segment(index=i, start=seg.start, end=end,
-                                text=seg.text.strip()))
+            text = seg.text.strip()
+            if text:
+                segs.append(Segment(index=i, start=seg.start, end=seg.end, text=text))
         return segs, info
 
     segments, info = _run_transcribe(vad=True)
 
-    if not segments:
+    if not segments and not is_music:
+        # Fallback sin VAD solo para voz hablada, nunca para música:
+        # sin VAD, Whisper alucina texto durante intros instrumentales
+        # y los asigna a timestamps tempranos, desincronizando todo.
         log.warning("[Whisper] VAD no detectó habla; reintentando sin VAD...")
         segments, info = _run_transcribe(vad=False)
 
